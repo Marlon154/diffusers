@@ -400,6 +400,8 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         dtype = self.text_encoder.dtype if self.text_encoder is not None else self.transformer.dtype
         text_ids = torch.zeros(batch_size, prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
         text_ids = text_ids.repeat(num_images_per_prompt, 1, 1)
+        # if editing_prompt_embeds is not None and editing_prompt_embeds.shape[0]:
+        #     text_ids = torch.cat([text_ids] * editing_prompt_embeds.shape[0])
 
         return prompt_embeds, pooled_prompt_embeds, text_ids, editing_prompt_embeds, pooled_editing_prompt
 
@@ -543,6 +545,8 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         self,
         prompt: Union[str, List[str]] = None,
         prompt_2: Optional[Union[str, List[str]]] = None,
+        negative_prompt: Union[str, List[str]] = None,
+        negative_prompt_2: Optional[Union[str, List[str]]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 28,
@@ -561,6 +565,7 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         max_sequence_length: int = 512,
         editing_prompt: Optional[Union[str, List[str]]] = None,
         editing_prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_editing_prompt_embeds: Optional[torch.FloatTensor] = None,
         reverse_editing_direction: Optional[Union[bool, List[bool]]] = False,
         edit_guidance_scale: Optional[Union[float, List[float]]] = 5,
         edit_warmup_steps: Optional[Union[int, List[int]]] = 10,
@@ -570,6 +575,7 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         edit_mom_beta: Optional[float] = 0.4,
         edit_weights: Optional[List[float]] = None,
         sem_guidance: Optional[List[torch.Tensor]] = None,
+        fake_cfg: bool = False,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -579,7 +585,7 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                 The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
                 instead.
             prompt_2 (`str` or `List[str]`, *optional*):
-                The prompt or prompts to be sent to `tokenizer_2` and `text_encoder_2`. If not defined, `prompt` is
+                The prompt or prompts to be sent to `tokenizer_2` and `text_encoder_2`. If not defined, `prompt`
                 will be used instead
             height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
                 The height in pixels of the generated image. This is set to 1024 by default for the best results.
@@ -703,7 +709,7 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             enabled_editing_prompts = 0
             enable_edit_guidance = False
 
-        self.do_classifier_free_guidance = guidance_scale > 1.0
+        self.do_classifier_free_guidance = guidance_scale > 0
 
         device = self._execution_device
 
@@ -729,9 +735,37 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             editing_prompt_embeds=editing_prompt_embeds,
         )
 
-        if enable_edit_guidance:
+        editing_prompt_embeds = torch.cat([editing_prompt_embeds] * batch_size, dim=0)
+        pooled_editing_prompt = torch.cat([pooled_editing_prompt] * batch_size, dim=0)
+
+        if fake_cfg:
+            (
+                neg_prompt_embeds,
+                pooled_neg_prompt_embeds,
+                neg_text_ids,
+                _, _
+            ) = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_2=negative_prompt_2,
+                prompt_embeds=None,
+                pooled_prompt_embeds=None,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                lora_scale=lora_scale,
+                editing_prompt=None,
+                editing_prompt_embeds=None,
+            )
+
+        if enable_edit_guidance and fake_cfg:
+            prompt_embeds = torch.cat([prompt_embeds, neg_prompt_embeds, editing_prompt_embeds], dim=0)
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, pooled_neg_prompt_embeds, pooled_editing_prompt], dim=0)
+        elif enable_edit_guidance:
             prompt_embeds = torch.cat([prompt_embeds, editing_prompt_embeds], dim=0)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, pooled_editing_prompt], dim=0)
+        elif fake_cfg:
+            prompt_embeds = torch.cat([prompt_embeds, neg_prompt_embeds], dim=0)
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, pooled_neg_prompt_embeds], dim=0)
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
@@ -745,6 +779,9 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
             generator,
             latents,
         )
+
+        latent_image_ids = torch.cat([latent_image_ids] * (1 + enabled_editing_prompts)) if self.do_classifier_free_guidance else latent_image_ids
+        text_ids = torch.cat([text_ids] * (1 + enabled_editing_prompts)) if self.do_classifier_free_guidance else text_ids
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
@@ -775,7 +812,8 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                     continue
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                latent_model_input = torch.cat([latents] * (1 + enabled_editing_prompts)) if self.do_classifier_free_guidance else latents
+                timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
 
                 # handle guidance
                 if self.transformer.config.guidance_embeds:
@@ -783,8 +821,6 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                     guidance = guidance.expand(latents.shape[0])
                 else:
                     guidance = None
-
-                latent_model_input = torch.cat([latents] * (1 + enabled_editing_prompts)) if self.do_classifier_free_guidance else latents
 
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
@@ -800,13 +836,18 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
 
                 # perform guidance
                 if self.do_classifier_free_guidance:
-                    noise_pred_out = noise_pred.chunk(1 + enabled_editing_prompts)
-                    noise_pred_text = noise_pred_out[0]
-                    noise_pred_uncond = noise_pred_text
-                    noise_pred_edit_concepts = noise_pred_out[1:]
-
-                    # default text guidance
-                    noise_guidance = noise_pred_text
+                    if fake_cfg:
+                        noise_pred_out = noise_pred.chunk(2 + enabled_editing_prompts)
+                        noise_pred_text = noise_pred_out[0]
+                        noise_pred_uncond = noise_pred_out[1]
+                        noise_pred_edit_concepts = noise_pred_out[2:]
+                        noise_guidance = noise_pred_text - noise_pred_uncond
+                    else:
+                        noise_pred_out = noise_pred.chunk(1 + enabled_editing_prompts)
+                        noise_pred_text = noise_pred_out[0]
+                        noise_pred_uncond = noise_pred_text
+                        noise_pred_edit_concepts = noise_pred_out[1:]
+                        noise_guidance = noise_pred_text
 
                     if edit_momentum is None:
                         edit_momentum = torch.zeros_like(noise_guidance)
@@ -859,8 +900,10 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                                 noise_guidance_edit[c, :, :, :] = torch.zeros_like(noise_pred_edit_concept)
                                 continue
 
-                            noise_guidance_edit_tmp = noise_pred_edit_concept - noise_pred_text  # simple sega
-                            # tmp_weights = (noise_pred_text - noise_pred_edit_concept).sum(dim=(1, 2, 3))
+                            if fake_cfg:
+                                noise_guidance_edit_tmp = noise_pred_edit_concept - noise_pred_uncond
+                            else:   # simple sega
+                                noise_guidance_edit_tmp = noise_pred_edit_concept - noise_pred_text
                             tmp_weights = (noise_guidance - noise_pred_edit_concept).sum(dim=(1, 2))
 
                             tmp_weights = torch.full_like(tmp_weights, edit_weight_c)  # * (1 / enabled_editing_prompts)
@@ -940,7 +983,10 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
                         edit_guidance = sem_guidance[i].to(device)
                         noise_guidance = noise_guidance + edit_guidance
 
-                    noise_pred = noise_guidance # simple sega
+                    if fake_cfg:
+                        noise_pred = noise_guidance + noise_pred_uncond
+                    else:  # simple sega
+                        noise_pred = noise_guidance
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
@@ -981,4 +1027,4 @@ class SemanticFluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin):
         if not return_dict:
             return (image,)
 
-        return FluxPipelineOutput(images=image)
+        return FluxPipelineOutput(image,)
